@@ -33,7 +33,38 @@ internal sealed class OverlayChannelServer : IDisposable
     {
         _listener.Start();
         _logger.LogInformation("叠加层通道已监听 127.0.0.1:{Port}", ((IPEndPoint)_listener.LocalEndpoint).Port);
+        // 日志一律经本通道回传宿主（JVM），不在本进程落盘
+        LogBridge.Sink = PushLog;
         _ = AcceptLoopAsync(_cts.Token);
+    }
+
+    /// <summary>把一条日志写入所有已连接宿主。</summary>
+    private void PushLog(int level, string message)
+    {
+        if (message == null) return;
+        WriteLineToAll(JsonSerializer.Serialize(new { type = "log", level, message }));
+    }
+
+    /// <summary>向所有已连接客户端写一行；无连接时丢弃。</summary>
+    private void WriteLineToAll(string line)
+    {
+        var bytes = Encoding.UTF8.GetBytes(line + "\n");
+        lock (_clients)
+        {
+            foreach (var c in _clients)
+            {
+                try
+                {
+                    var s = c.GetStream();
+                    s.Write(bytes, 0, bytes.Length);
+                    s.Flush();
+                }
+                catch
+                {
+                    // 连接已断：读取侧会移除
+                }
+            }
+        }
     }
 
     private async Task AcceptLoopAsync(CancellationToken token)

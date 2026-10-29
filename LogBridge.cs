@@ -30,8 +30,17 @@ public static class LogBridge
     /// <summary>当前是否已安装回调。</summary>
     public static bool HasCallback => _callback != 0;
 
-    /// <summary>转发一条日志；未安装回调时丢弃。</summary>
-    public static unsafe void Write(int level, string message)
+    /// <summary>日志出口：由宿主装配（当前为通道回传）。</summary>
+    public static Action<int, string>? Sink;
+
+    /// <summary>转发一条日志；无出口时丢弃。</summary>
+    public static void Write(int level, string message)
+    {
+        Sink?.Invoke(level, message);
+    }
+
+    /// <summary>经 C ABI 回调转发（保留面；当前宿主改用通道回传）。</summary>
+    public static unsafe void WriteNative(int level, string message)
     {
         var cb = _callback;
         if (cb == 0 || message == null) return;
@@ -53,7 +62,7 @@ public static class LogBridge
     {
         public IDisposable? BeginScope<TState>(TState state) where TState : notnull => NullScope.Instance;
 
-        public bool IsEnabled(LogLevel logLevel) => HasCallback && logLevel != LogLevel.None;
+        public bool IsEnabled(LogLevel logLevel) => Sink != null && logLevel != LogLevel.None;
 
         public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception? exception,
             Func<TState, Exception?, string> formatter)
