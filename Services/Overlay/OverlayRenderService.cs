@@ -1,0 +1,588 @@
+using System.Collections.Concurrent;
+using System.Runtime.InteropServices;
+using NotifyRelay.Models.Render;
+using Vortice;
+using Vortice.Direct2D1;
+using Vortice.DirectWrite;
+using Vortice.Mathematics;
+using Vortice.WIC;
+using static NotifyRelay.Services.Overlay.Win32;
+
+namespace NotifyRelay.Services.Overlay;
+
+public sealed partial class OverlayRenderService : IDisposable, IOverlayWatchdogHost, IOverlayDataSink
+{
+    private readonly ILogger<OverlayRenderService> _logger;
+    private readonly IOverlaySettings _settings;
+    private readonly ID2D1Factory _d2dFactory;
+    private readonly IDWriteFactory _dwFactory;
+    private readonly IWICImagingFactory _wicFactory;
+
+    // ===== 管理单元 =====
+    // 窗口/渲染核心、控制窗口、置顶监控、看门狗、延迟释放各自内聚，
+    // 本服务只保留渲染循环与生命周期协调；新增叠加层元素直接复用这些单元。
+    private readonly OverlayWindowManager _windowManager;
+    private readonly OverlayControlWindow _controlWindow;
+    private readonly OverlayTopmostMonitor _topmostMonitor;
+    private readonly OverlayWatchdog _watchdog;
+    private readonly DeferredDisposer _disposer;
+
+    private Thread? _renderThread;
+    private volatile int _runningFlag;   // 0=未启动/已停止, 1=运行中（原子争用启动所有权，供看门狗/并发调用安全）
+    // 恢复清理挂起标志：看门狗检测到卡死并确认旧线程退出后置位，
+    // 由新启动的渲染线程在创建窗口前执行残留资源清理（保证窗口操作线程亲和）。
+    private volatile bool _recoveryCleanupPending;
+
+    private int _consecutiveRenderFails;
+    private const int MaxConsecutiveRenderFails = 60;
+
+    // 顶部卡片（媒体 + SuperIsland），由 _lock 保护
+    private readonly List<OverlayItem> _topItems = [];
+    private readonly object _lock = new();
+
+    // 弹幕请求队列（跨线程），由渲染线程分发到各屏覆盖层
+    private readonly ConcurrentQueue<DanmakuRequest> _requests = new();
+
+    private DanmakuStyleSettings _currentStyle = new();
+    private volatile int _maxFps;         // 0 = 跟随刷新率(DwmFlush)；否则为帧率上限
+    private int _screenMode;              // 当前多屏模式，变化时触发覆盖层重建
+    private volatile bool _displayDirty;
+    private readonly Random _rand = new();
+
+    public OverlayRenderService(ILogger<OverlayRenderService> logger, IOverlaySettings settings)
+    {
+        _logger = logger;
+        _settings = settings;
+        _d2dFactory = D2D1.D2D1CreateFactory<ID2D1Factory>();
+        _dwFactory = DWrite.DWriteCreateFactory<IDWriteFactory>();
+        _wicFactory = new IWICImagingFactory();
+
+        _windowManager = new OverlayWindowManager(_d2dFactory, logger);
+        _controlWindow = new OverlayControlWindow(
+            // 显示模式切换：置脏以触发几何同步（重断言 TOPMOST 由控制窗口内部预约）
+            onDisplayChanged: () => _displayDirty = true,
+            onReassertTopmost: ReassertTopmost);
+        _topmostMonitor = new OverlayTopmostMonitor(logger);
+        _watchdog = new OverlayWatchdog(logger, this);
+        _disposer = new DeferredDisposer(logger);
+
+        // 声明式 UI 元素集合（在主体构造函数内固定创建，见 OverlayRenderService.Elements.cs）
+        InitializeElements();
+    }
+
+    /// <summary>弹幕请求（业务线程入队，渲染线程分发）。</summary>
+    private sealed class DanmakuRequest
+    {
+        public string Text = string.Empty;
+        public byte[]? IconPng;
+        public DanmakuStyleSettings Settings = new();
+        /// <summary>稳定来源键；为空表示一次性弹幕。</summary>
+        public string? SourceKey;
+    }
+
+    /// <summary>每次启动完成后触发（含看门狗重启），供宿主重推数据快照。</summary>
+    public event EventHandler? Started;
+
+    /// <summary>
+    /// 叠加层模块主初始化：载入设置、启动渲染线程与看门狗。
+    /// 数据由宿主经 <see cref="IOverlayDataSink"/> 推送。
+    /// </summary>
+    void IOverlayDataSink.Start()
+    {
+        // 原子争用启动所有权：仅当仍处未启动态(0)时置为运行态(1)，
+        // 其他线程已拥有启动则直接返回，避免并发 Start 启动多个渲染线程。
+        if (Interlocked.CompareExchange(ref _runningFlag, 1, 0) != 0)
+            return;
+        // 启动时从已保存设置初始化样式，避免首条弹幕使用默认值（需手动调节才生效）
+        LoadInitialStyle();
+        // 4 个 LoadInitialXxxConfig 收敛为元素统一的 LoadSettings
+        LoadInitialElementSettings();
+        _watchdog.UpdateHeartbeat();
+        _renderThread = new Thread(RenderLoop) { IsBackground = true, Name = "D2D-Overlay" };
+        _renderThread.SetApartmentState(ApartmentState.STA);
+        _renderThread.Start();
+        _watchdog.EnsureStarted();
+        Started?.Invoke(this, EventArgs.Empty);
+    }
+
+    /// <summary>从已保存的设置构建初始样式并写入 _currentStyle / _maxFps。</summary>
+    private void LoadInitialStyle()
+    {
+        var s = _settings;
+        var style = new DanmakuStyleSettings
+        {
+            FontSizePercent = s.DanmakuFontSizePercent,
+            Speed = s.DanmakuSpeed,
+            OpacityPercent = s.DanmakuOpacityPercent,
+            DisplayAreaPercent = s.DanmakuDisplayAreaPercent,
+            Density = s.DanmakuDensity,
+            FontFamilyName = s.DanmakuFontFamily,
+            Bold = s.DanmakuBold,
+            ColorR = ParseColorChannel(s.DanmakuColor, 255, 0),
+            ColorG = ParseColorChannel(s.DanmakuColor, 255, 2),
+            ColorB = ParseColorChannel(s.DanmakuColor, 255, 4),
+            BorderEnabled = s.DanmakuBorderEnabled,
+            BorderThickness = s.DanmakuBorderThickness,
+            BorderColorR = ParseColorChannel(s.DanmakuBorderColor, 0, 0),
+            BorderColorG = ParseColorChannel(s.DanmakuBorderColor, 0, 2),
+            BorderColorB = ParseColorChannel(s.DanmakuBorderColor, 0, 4),
+            ShadowEnabled = s.DanmakuShadowEnabled,
+            ShadowDepth = s.DanmakuShadowDepth,
+            ShadowOpacity = s.DanmakuShadowOpacity,
+            ShadowColorR = ParseColorChannel(s.DanmakuShadowColor, 0, 0),
+            ShadowColorG = ParseColorChannel(s.DanmakuShadowColor, 0, 2),
+            ShadowColorB = ParseColorChannel(s.DanmakuShadowColor, 0, 4),
+            DisplayScreenMode = s.DanmakuDisplayScreenMode,
+            PerformanceMode = s.DanmakuPerformanceMode
+        };
+        lock (_lock)
+        {
+            _currentStyle = style;
+            _maxFps = style.PerformanceMode switch
+            {
+                1 => 60,
+                2 => 30,
+                _ => 0
+            };
+        }
+    }
+
+    private static byte ParseColorChannel(string? hex, byte fallback, int offset)
+        => UI.ColorHexParser.ParseChannel(hex, fallback, offset);
+
+    void IOverlayDataSink.Stop()
+    {
+        Interlocked.Exchange(ref _runningFlag, 0);
+        _watchdog.Stop();
+        _renderThread?.Join(2000);
+        CleanupOverlays();
+    }
+
+    private void RenderLoop()
+    {
+        timeBeginPeriod(1);
+        try
+        {
+            // 恢复场景：旧线程退出后残留窗口/DC 可能未被回收，必须在渲染线程（窗口创建线程）执行清理，
+            // 清理成功、句柄状态归零后再由下方流程重建窗口，避免跨线程 DestroyWindow 引发句柄状态错乱。
+            if (_recoveryCleanupPending)
+            {
+                _recoveryCleanupPending = false;
+                PerformRecoveryCleanup();
+            }
+
+            _controlWindow.EnsureWindowClass();
+            _topmostMonitor.Install(EnsureOverlaysTopmost);
+            SyncOverlays();
+            _controlWindow.Create();
+
+            var timer = Stopwatch.StartNew();
+            double nextFrame = 0;
+            int frameCount = 0;
+            bool anyVisible = false;
+
+            while (_runningFlag != 0)
+            {
+                while (PeekMessageW(out var msg, IntPtr.Zero, 0, 0, 1))
+                {
+                    TranslateMessage(ref msg);
+                    DispatchMessageW(ref msg);
+                }
+
+                // 渲染线程心跳：供看门狗检测卡死（消息泵或渲染卡住都会停止更新）
+                _watchdog.UpdateHeartbeat();
+
+                // 释放业务线程延迟入队的 D2D/DWrite 对象（锁外，绘制前统一执行）
+                _disposer.Flush();
+
+                // 定期检测显示器热插拔 / 模式变更
+                if ((frameCount++ & 63) == 0 || _displayDirty)
+                {
+                    _displayDirty = false;
+                    SyncOverlays();
+                    // 周期巡检兜底：无条件重断言 TOPMOST 层级（约每秒一次，成本极低）。
+                    // 覆盖"标志仍在但 z-order 被全屏游戏/系统重建压到普通窗口之下"的失效场景，
+                    // 以及 WinEvent 钩子漏触发的置顶重置。
+                    OverlayTopmostMonitor.ReassertOverlaysTopmost(_windowManager.Overlays);
+                }
+
+                DispatchRequests();
+
+                bool hasContent = TopItemsActive();
+                if (!hasContent)
+                {
+                    foreach (var o in _windowManager.Overlays)
+                        if (o.Items.Count > 0 || o.Pending.Count > 0) { hasContent = true; break; }
+                }
+                if (!hasContent && !_requests.IsEmpty) hasContent = true;
+                // 5 个叠加层元素（心率/时钟/键盘/罗技/余额）各自独立驱动，收敛为一次遍历
+                if (!hasContent) hasContent = AnyElementActive();
+
+                if (!hasContent)
+                {
+                    // 空闲：隐藏所有窗口并降频休眠，避免占用游戏帧率
+                    if (anyVisible)
+                    {
+                        foreach (var o in _windowManager.Overlays)
+                            if (o.Visible) { ShowWindow(o.Hwnd, SW_HIDE); o.Visible = false; }
+                        anyVisible = false;
+                    }
+                    Thread.Sleep(30);
+                    continue;
+                }
+
+                // 帧率上限（均衡/游戏档）——通过休眠限帧
+                int maxFps = _maxFps;
+                if (maxFps > 0)
+                {
+                    double frameTime = 1.0 / maxFps;
+                    double now = timer.Elapsed.TotalSeconds;
+                    if (now < nextFrame)
+                    {
+                        int waitMs = (int)((nextFrame - now) * 1000);
+                        if (waitMs > 1) Thread.Sleep(waitMs - 1);
+                        while (timer.Elapsed.TotalSeconds < nextFrame) Thread.SpinWait(10);
+                    }
+                    nextFrame = timer.Elapsed.TotalSeconds + frameTime;
+                }
+
+                // 单帧渲染保护：失败时记录并继续，连续失败过多则退出循环交由看门狗恢复
+                try
+                {
+                    double ts = Stopwatch.GetTimestamp();
+                    double freq = Stopwatch.Frequency;
+                    foreach (var o in _windowManager.Overlays)
+                        RenderOverlay(o, ts, freq);
+                    anyVisible = true;
+
+                    // 流畅档：跟随显示器刷新率
+                    if (maxFps <= 0) DwmFlush();
+                    _consecutiveRenderFails = 0;
+                }
+                catch (Exception ex)
+                {
+                    _consecutiveRenderFails++;
+                    if (_consecutiveRenderFails == 1 || _consecutiveRenderFails % 10 == 0)
+                        OverlayCrashLog.Write($"覆盖层渲染帧失败 #{_consecutiveRenderFails}", ex);
+                    if (_consecutiveRenderFails >= MaxConsecutiveRenderFails)
+                    {
+                        OverlayCrashLog.Write("覆盖层渲染连续失败次数过多，退出渲染循环，交由看门狗恢复");
+                        _logger.LogError(ex, "OverlayRenderService 渲染连续失败 {Count} 次，退出渲染循环", _consecutiveRenderFails);
+                        break;
+                    }
+                    Thread.Sleep(100);
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            OverlayCrashLog.Write("覆盖层渲染线程崩溃", ex);
+            _logger.LogError(ex, "OverlayRenderService 渲染线程异常退出");
+        }
+        finally
+        {
+            _controlWindow.Destroy();
+            _topmostMonitor.Uninstall();
+            timeEndPeriod(1);
+            // 渲染线程退出时销毁自身创建的窗口，避免全屏覆盖层滞留屏幕抢占鼠标/层级
+            CleanupOverlays();
+        }
+    }
+
+    /// <summary>
+    /// 重新断言所有覆盖层窗口的 TOPMOST z-order。
+    /// 显示模式切换（如独占全屏游戏退出）会导致系统重建窗口 z-order、
+    /// 丢失创建时设置的顶层状态，需在切换后/重新显示时主动重设。
+    /// NOMOVE|NOSIZE|NOACTIVATE 无移动/缩放/激活副作用，不会引起闪烁。
+    /// </summary>
+    private void ReassertTopmost()
+    {
+        foreach (var o in _windowManager.Overlays)
+            if (o.Hwnd != IntPtr.Zero)
+                SetWindowPos(o.Hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    }
+
+    /// <summary>置顶监控回调：检查所有可见覆盖层是否保持 WS_EX_TOPMOST，被重置则恢复。</summary>
+    private void EnsureOverlaysTopmost()
+        => OverlayTopmostMonitor.EnsureOverlaysTopmost(_windowManager.Overlays);
+
+    /// <summary>根据当前多屏模式与显示器布局，按需重建覆盖层窗口集合。</summary>
+    private void SyncOverlays()
+    {
+        int mode;
+        lock (_lock) mode = _currentStyle.DisplayScreenMode;
+        _screenMode = mode;
+        _windowManager.SyncOverlays(mode, () =>
+        {
+            InvalidateTopItemDeviceResources();
+            ClearPerOverlayRenderState();
+        });
+    }
+
+    /// <summary>销毁并清空所有覆盖层窗口与顶部卡片资源（渲染线程调用）。</summary>
+    private void CleanupOverlays()
+    {
+        // 统一释放范围：声明式 UI 树与元素缓存（心率几何、各节点槽位中的 DWrite 资源、画刷）
+        ResetUiAndElements();
+        _windowManager.Cleanup();
+        // 时钟门控状态按窗口实例记录，窗口销毁后一并清理，避免残留引用
+        _lastClockTextByOverlay.Clear();
+        _lastClockRootByOverlay.Clear();
+        lock (_lock)
+        {
+            foreach (var item in _topItems) item.Dispose();
+            _topItems.Clear();
+        }
+    }
+
+    /// <summary>
+    /// 业务线程延迟释放 D2D/DWrite 对象：仅入队，不直接释放，
+    /// 由渲染线程在安全时机（绘制前、对象已脱离快照）统一执行。
+    /// </summary>
+    private void DeferDispose(IDisposable? d)
+        => _disposer.Enqueue(d);
+
+    private bool TopItemsActive()
+    {
+        lock (_lock)
+        {
+            foreach (var it in _topItems)
+                if (it.Active) return true;
+        }
+        return false;
+    }
+
+    private void RenderOverlay(ScreenOverlay o, double now, double freq)
+    {
+        var rt = o.RenderTarget;
+        if (rt == null) return;
+
+        // 除时钟外的其他内容：决定本窗口是否仍需清除并重绘。
+        // 时钟自身不参与 otherContent 判定 —— 它走下方「仅秒变化时重绘」的门控，
+        // 否则每帧都会被判为 dirty，秒级优化会失效。
+        bool otherContent = o.Items.Count > 0 || o.Pending.Count > 0
+            || (o.IsPrimary && TopItemsActive())
+            || AnyNonClockElementTargets(o);
+
+        bool clockTarget = _clockElement!.IsTargetScreen(o);
+        if (!otherContent && !clockTarget)
+        {
+            if (o.Visible) { ShowWindow(o.Hwnd, SW_HIDE); o.Visible = false; }
+            return;
+        }
+
+        // 时钟是否需要刷新：时间文本变化 / 窗口尚未可见 / 渲染目标变化（本窗口 UI 树刚被重建）。
+        // 仅时钟且本帧无需刷新时，保留窗口上一帧画面可见、跳过清除与重绘，避免每帧重绘。
+        string clockText = _clockElement.GetTimeText();
+        var ui = GetUiRoot(o);
+        _lastClockTextByOverlay.TryGetValue(o, out string? lastText);
+        bool clockDirty = clockTarget
+            && (clockText != lastText || !o.Visible || !ReferenceEquals(_lastClockRootByOverlay.GetValueOrDefault(o), ui));
+        _lastClockTextByOverlay[o] = clockText;
+        _lastClockRootByOverlay[o] = ui;
+        if (clockTarget && !clockDirty && !otherContent)
+            return;   // 时钟窗口保持可见，不重绘
+
+        rt.BeginDraw();
+        rt.Clear(new Color4(0, 0, 0, 0));
+
+        // 阶段一：顶部卡片（媒体 + 超级岛）——声明式
+        if (o.IsPrimary)
+            RenderTopCards(o, now, freq);
+        else
+            o.TopOffset = 0;
+
+        var paint = ui.CreatePaintScope(rt, now, freq);
+        ui.PaintTopCards(paint);
+
+        // 阶段二：弹幕——保留命令式（轨道分配与跨屏分发依赖窗口集合与时间推进）
+        SpawnPending(o, rt);
+        for (int i = o.Items.Count - 1; i >= 0; i--)
+        {
+            var item = o.Items[i];
+            double elapsed = (now - item.StartTime) / freq;
+            double x = item.SpawnX - elapsed * item.Settings.PixelsPerSecond;
+            // 在屏条目的内容被更新后布局为空，按当前滚动位置重建绘制资源
+            if (item.TextLayout == null)
+                EnsureDanmakuResources(item, rt);
+            if (x < -item.TotalWidth - 50)
+            {
+                item.Dispose();
+                o.Items.RemoveAt(i);
+                continue;
+            }
+            DrawDanmaku(item, (float)x, rt);
+        }
+
+        // 阶段三：元素层（5 个叠加层元素）——声明式
+        ComposeElements(ui, o);
+        ui.PaintElements(paint);
+
+        rt.EndDraw();
+
+        var ptSrc = new POINT(0, 0);
+        var size = new SIZE(o.Width, o.Height);
+        var ptDst = new POINT(o.OriginX, o.OriginY);
+        var blend = new BLENDFUNCTION { BlendOp = AC_SRC_OVER, BlendFlags = 0, SourceConstantAlpha = 255, AlphaFormat = AC_SRC_ALPHA };
+        UpdateLayeredWindow(o.Hwnd, IntPtr.Zero, ref ptDst, ref size, o.MemDC, ref ptSrc, 0, ref blend, ULW_ALPHA);
+
+        if (!o.Visible)
+        {
+            ShowWindow(o.Hwnd, SW_SHOWNOACTIVATE);
+            // 重新显示时预约 TOPMOST 重断言，交由 UI 线程(WndProc)延迟执行，避免在后台渲染线程直接操作窗口
+            _controlWindow.ScheduleReassertTopmost();
+            o.Visible = true;
+        }
+    }
+
+    /// <summary>
+    /// 时钟「仅秒变化时重绘」门控状态（仅渲染线程访问）。
+    /// 按键为窗口实例：UI 树被重建（覆盖层重建 / rt 变化）时引用不同，据此强制重绘一次。
+    /// </summary>
+    private readonly Dictionary<ScreenOverlay, string?> _lastClockTextByOverlay = [];
+    private readonly Dictionary<ScreenOverlay, UI.OverlayUiRoot?> _lastClockRootByOverlay = [];
+
+    /// <summary>
+    /// 渲染线程分发弹幕请求。带稳定键的请求先更新本屏同键弹幕（在屏条目或待发条目），
+    /// 无同键条目时新增；无键请求每次新增。
+    /// </summary>
+    private void DispatchRequests()
+    {
+        while (_requests.TryDequeue(out var req))
+        {
+            foreach (var o in SelectTargets(req.Settings.DisplayScreenMode))
+            {
+                if (req.SourceKey != null && TryUpdateDanmaku(o, req)) continue;
+
+                var item = new DanmakuItem
+                {
+                    Text = req.Text,
+                    IconPng = req.IconPng,
+                    Settings = req.Settings,
+                    SourceKey = req.SourceKey
+                };
+                o.Pending.Enqueue(item);
+            }
+        }
+    }
+
+    /// <summary>用请求内容更新本屏同键弹幕，命中返回 true。待发条目保持原队列位置。</summary>
+    private bool TryUpdateDanmaku(ScreenOverlay overlay, DanmakuRequest req)
+    {
+        var key = req.SourceKey;
+        if (key == null) return false;
+
+        foreach (var item in overlay.Items)
+        {
+            if (!item.Active || item.SourceKey != key) continue;
+            ApplyDanmakuContent(item, req);
+            return true;
+        }
+
+        foreach (var item in overlay.Pending)
+        {
+            if (item.SourceKey != key) continue;
+            ApplyDanmakuContent(item, req);
+            return true;
+        }
+
+        return false;
+    }
+
+    /// <summary>替换弹幕内容，并置空绘制资源等待渲染线程重建；旧资源延迟释放。</summary>
+    private void ApplyDanmakuContent(DanmakuItem item, DanmakuRequest req)
+    {
+        item.Text = req.Text;
+        item.IconPng = req.IconPng;
+        item.Settings = req.Settings;
+        DeferDispose(item.TextLayout);
+        item.TextLayout = null;
+        DeferDispose(item.IconBitmap);
+        item.IconBitmap = null;
+    }
+
+    private List<ScreenOverlay> SelectTargets(int mode)
+    {
+        var overlays = _windowManager.Overlays;
+        var primary = _windowManager.PrimaryOverlay;
+        if (overlays.Count == 0) return [];
+        switch (mode)
+        {
+            case 1: // 所有屏幕
+                {
+                    var all = new List<ScreenOverlay>(overlays.Count);
+                    for (int i = 0; i < overlays.Count; i++)
+                        if (!overlays[i].IsSpan) all.Add(overlays[i]);
+                    return all;
+                }
+            case 2: // 鼠标所在屏幕
+                {
+                    GetCursorPos(out var pt);
+                    ScreenOverlay? hit = null;
+                    for (int i = 0; i < overlays.Count; i++)
+                    {
+                        var o = overlays[i];
+                        if (o.IsSpan) continue;
+                        if (pt.X >= o.OriginX && pt.X < o.OriginX + o.Width
+                            && pt.Y >= o.OriginY && pt.Y < o.OriginY + o.Height)
+                        {
+                            hit = o;
+                            break;
+                        }
+                    }
+                    return [hit ?? primary ?? overlays[0]];
+                }
+            case 3: // 跨屏连续流
+                return [_windowManager.SpanOverlay ?? primary ?? overlays[0]];
+            default: // 仅主屏
+                return [primary ?? overlays[0]];
+        }
+    }
+
+    #region IOverlayWatchdogHost 显式实现（供看门狗做故障隔离与自动恢复）
+
+    bool IOverlayWatchdogHost.Running
+    {
+        get => _runningFlag != 0;
+        set => Interlocked.Exchange(ref _runningFlag, value ? 1 : 0);
+    }
+
+    IntPtr IOverlayWatchdogHost.ControlHandle => _controlWindow.Handle;
+
+    IReadOnlyList<ScreenOverlay> IOverlayWatchdogHost.Overlays => _windowManager.Overlays;
+
+    Thread? IOverlayWatchdogHost.RenderThread
+    {
+        get => _renderThread;
+        set => _renderThread = value;
+    }
+
+    void IOverlayWatchdogHost.RequestRecoveryCleanup()
+        // 仅置位标志：实际清理由新渲染线程在 RenderLoop 启动时执行，确保窗口操作线程亲和
+        => _recoveryCleanupPending = true;
+
+    /// <summary>
+    /// 恢复清理的具体执行（仅由渲染线程调用）：销毁控制窗口与覆盖层窗口。
+    /// 窗口句柄/DC 均由渲染线程创建，须在渲染线程执行 Win32.DestroyWindow 与
+    /// OverlayWindowManager.Cleanup，且清理成功（句柄归零）后再由重建流程更新状态。
+    /// </summary>
+    private void PerformRecoveryCleanup()
+    {
+        _controlWindow.Destroy();
+        CleanupOverlays();
+    }
+
+    void IOverlayWatchdogHost.Restart() => ((IOverlayDataSink)this).Start();
+
+    #endregion
+
+    public void Dispose()
+    {
+        ((IOverlayDataSink)this).Stop();
+        ResetUiAndElements();
+        _wicFactory.Dispose();
+        _dwFactory.Dispose();
+        _d2dFactory.Dispose();
+    }
+}

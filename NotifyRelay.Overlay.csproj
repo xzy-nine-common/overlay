@@ -1,0 +1,28 @@
+<Project Sdk="Microsoft.NET.Sdk">
+    <PropertyGroup>
+        <TargetFramework>net10.0-windows10.0.26100</TargetFramework>
+        <Platforms>x64;ARM64;x86</Platforms>
+        <LangVersion>Preview</LangVersion>
+        <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+        <!-- 独立子模块：自包含，不依赖上层 Directory.*.props -->
+        <ImplicitUsings>enable</ImplicitUsings>
+        <Nullable>disable</Nullable>
+        <ManagePackageVersionsCentrally>false</ManagePackageVersionsCentrally>
+        <GenerateDocumentationFile>false</GenerateDocumentationFile>
+    </PropertyGroup>
+    <!-- 库仅包含叠加层本身；OverlayHost 是独立宿主工程，不参与本库编译 -->
+    <ItemGroup>
+        <Compile Remove="OverlayHost\**" />
+        <None Remove="OverlayHost\**" />
+    </ItemGroup>
+    <ItemGroup>
+        <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="11.0.0-preview.6.26359.118" />
+        <PackageReference Include="Vortice.Direct2D1" Version="3.8.3" />
+        <PackageReference Include="Vortice.Mathematics" Version="2.1.1" />
+    </ItemGroup>
+    <!--
+        logi-battery 罗技电池小工具的 Rust 实现不随本子模块分发。
+        LogiBatteryNative 为 internal P/Invoke，仅在运行期调用 lb_* 时才加载 DLL，
+        缺失 DLL 不影响编译；宿主未推送设备数据时该元素不绘制。
+    -->
+</Project>

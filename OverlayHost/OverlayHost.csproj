@@ -1,0 +1,22 @@
+<Project Sdk="Microsoft.NET.Sdk">
+    <PropertyGroup>
+        <OutputType>WinExe</OutputType>
+        <TargetFramework>net10.0-windows10.0.26100</TargetFramework>
+        <Platforms>x64;ARM64;x86</Platforms>
+        <LangVersion>Preview</LangVersion>
+        <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+        <ImplicitUsings>enable</ImplicitUsings>
+        <Nullable>disable</Nullable>
+        <ManagePackageVersionsCentrally>false</ManagePackageVersionsCentrally>
+        <ApplicationManifest>app.manifest</ApplicationManifest>
+        <AssemblyName>OverlayHost</AssemblyName>
+        <RootNamespace>OverlayHost</RootNamespace>
+    </PropertyGroup>
+    <ItemGroup>
+        <ProjectReference Include="..\NotifyRelay.Overlay.csproj" />
+    </ItemGroup>
+    <ItemGroup>
+        <PackageReference Include="Microsoft.Extensions.Logging" Version="11.0.0-preview.6.26359.118" />
+        <PackageReference Include="Microsoft.Extensions.Logging.Console" Version="11.0.0-preview.6.26359.118" />
+    </ItemGroup>
+</Project>
