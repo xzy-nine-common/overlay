@@ -7,26 +7,22 @@ using NotifyRelay.Services.Overlay;
 /// 叠加层伴生进程入口，由 JVM 桌面端在启动时拉起、退出时终止。
 ///
 /// 与主程序的两条连接：
-/// 1. TCP 回环 + UTF-8 JSON 行（数据面）；
-/// 2. 日志经 <see cref="LogBridge"/> 的 C ABI 回调交给 JVM（与 Rust `log_bridge` 同构）。
+/// 1. 命名管道 + UTF-8 JSON 行（数据面与日志面复用同一条管道）；
+/// 2. 日志经 <see cref="LogBridge"/> 的出口回传给 JVM（与 Rust `log_bridge` 同构）。
 ///
-/// 用法：<c>OverlayHost.exe [端口]</c>，默认 45678。
+/// 用法：<c>OverlayHost.exe [管道名]</c>，默认 <see cref="OverlayChannelServer.DefaultPipeName"/>。
 /// 进程为 WinExe，无控制台窗口。
 /// </summary>
 internal static class Program
 {
-    private const int DefaultPort = 45678;
-
     [STAThread]
     private static int Main(string[] args)
     {
-        var port = DefaultPort;
-        if (args.Length > 0 && int.TryParse(args[0], out var parsed) && parsed is > 0 and < 65536)
-        {
-            port = parsed;
-        }
+        var pipeName = args.Length > 0 && !string.IsNullOrWhiteSpace(args[0])
+            ? args[0]
+            : OverlayChannelServer.DefaultPipeName;
 
-        // 日志一律经 LogBridge 转发给 JVM；未安装回调时静默丢弃，不写控制台或文件
+        // 日志一律经 LogBridge 转发给 JVM；未安装出口时静默丢弃，不写控制台或文件
         using var loggerFactory = LoggerFactory.Create(b => b
             .ClearProviders()
             .AddProvider(new BridgeLoggerProvider())
@@ -38,13 +34,13 @@ internal static class Program
         OverlayChannelServer channel = null;
         try
         {
-            // 先起通道再起渲染：渲染期日志才有接收方（JVM 连接后即可见）
+            // 先建通道对象并挂日志出口，再起渲染：渲染期日志才有所归
+            channel = new OverlayChannelServer(pipeName, null, logger);
             service = new OverlayRenderService(
                 loggerFactory.CreateLogger<OverlayRenderService>(),
                 new DefaultOverlaySettings());
             sink = service;
-
-            channel = new OverlayChannelServer(port, sink, logger);
+            channel.BindSink(sink);
             channel.Start();
 
             sink.Start();
