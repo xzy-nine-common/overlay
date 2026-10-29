@@ -6,7 +6,7 @@
         <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
         <!-- 独立子模块：自包含，不依赖上层 Directory.*.props -->
         <ImplicitUsings>enable</ImplicitUsings>
-        <Nullable>disable</Nullable>
+        <Nullable>enable</Nullable>
         <ManagePackageVersionsCentrally>false</ManagePackageVersionsCentrally>
         <GenerateDocumentationFile>false</GenerateDocumentationFile>
     </PropertyGroup>
