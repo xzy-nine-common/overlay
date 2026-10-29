@@ -3,15 +3,15 @@ namespace OverlayHost;
 using Microsoft.Extensions.Logging;
 using NotifyRelay.Services.Overlay;
 
-
-
 /// <summary>
-/// 叠加层伴生进程入口。
+/// 叠加层伴生进程入口，由 JVM 桌面端在启动时拉起、退出时终止。
 ///
-/// 由 JVM 桌面端在启动时拉起、退出时终止；两者经 TCP 回环 + UTF-8 JSON 行通信，
-/// 进程隔离保证 D2D 渲染异常不会影响主程序。
+/// 与主程序的两条连接：
+/// 1. TCP 回环 + UTF-8 JSON 行（数据面）；
+/// 2. 日志经 <see cref="LogBridge"/> 的 C ABI 回调交给 JVM（与 Rust `log_bridge` 同构）。
 ///
-/// 用法：<c>OverlayHost.exe [端口]</c>，默认端口 45678。
+/// 用法：<c>OverlayHost.exe [端口]</c>，默认 45678。
+/// 进程为 WinExe，无控制台窗口。
 /// </summary>
 internal static class Program
 {
@@ -26,8 +26,10 @@ internal static class Program
             port = parsed;
         }
 
+        // 日志一律经 LogBridge 转发给 JVM；未安装回调时静默丢弃，不写控制台或文件
         using var loggerFactory = LoggerFactory.Create(b => b
-            .AddSimpleConsole(o => { o.SingleLine = true; o.TimestampFormat = "HH:mm:ss "; })
+            .ClearProviders()
+            .AddProvider(new BridgeLoggerProvider())
             .SetMinimumLevel(LogLevel.Information));
         var logger = loggerFactory.CreateLogger("OverlayHost");
 
@@ -39,7 +41,6 @@ internal static class Program
             service = new OverlayRenderService(
                 loggerFactory.CreateLogger<OverlayRenderService>(),
                 new DefaultOverlaySettings());
-            // Start/Stop 为显式接口实现，必须经接口调用
             sink = service;
             sink.Start();
             logger.LogInformation("叠加层渲染已启动");
@@ -47,7 +48,6 @@ internal static class Program
             channel = new OverlayChannelServer(port, sink, logger);
             channel.Start();
 
-            // 无窗口消息循环：渲染线程由 OverlayRenderService 自带，主线程仅保持存活
             using var exit = new ManualResetEventSlim(false);
             Console.CancelKeyPress += (_, e) => { e.Cancel = true; exit.Set(); };
             AppDomain.CurrentDomain.ProcessExit += (_, _) => exit.Set();
@@ -65,5 +65,13 @@ internal static class Program
             try { sink?.Stop(); } catch { }
             try { service?.Dispose(); } catch { }
         }
+    }
+
+    /// <summary>把 ILogger 输出接到 <see cref="LogBridge"/> 的日志提供者。</summary>
+    private sealed class BridgeLoggerProvider : ILoggerProvider
+    {
+        public ILogger CreateLogger(string categoryName) => LogBridge.CreateLogger(categoryName);
+
+        public void Dispose() { }
     }
 }

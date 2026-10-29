@@ -94,85 +94,8 @@ internal sealed class OverlayChannelServer : IDisposable
         lock (_clients) _clients.Remove(client);
     }
 
-    /// <summary>按 <c>type</c> 分派一条消息。</summary>
-    private void Dispatch(string line)
-    {
-        using var doc = JsonDocument.Parse(line);
-        var root = doc.RootElement;
-        var type = root.TryGetProperty("type", out var t) ? t.GetString() : null;
-        switch (type)
-        {
-            case "danmaku":
-                _sink.ShowDanmaku(
-                    Str(root, "appName"),
-                    Str(root, "title"),
-                    Str(root, "body"),
-                    Bytes(root, "iconPng"),
-                    Str(root, "deviceName"),
-                    StrOrNull(root, "sourceKey"));
-                break;
-            case "media_update":
-                _sink.ShowMediaCard(
-                    Str(root, "deviceId"),
-                    Str(root, "deviceName"),
-                    Str(root, "title"),
-                    Str(root, "artist"),
-                    Bytes(root, "coverPng"),
-                    Bool(root, "isPlaying"));
-                break;
-            case "media_remove":
-                _sink.RemoveMediaCard(Str(root, "deviceId"));
-                break;
-            case "superisland_update":
-                _logger.LogWarning("超级岛消息暂未接线（等待 :superislandui 渲染接入）");
-                break;
-            case "superisland_remove":
-                _logger.LogWarning("超级岛移除消息暂未接线");
-                break;
-            case "style_update":
-                ApplyStyle(root);
-                break;
-            default:
-                _logger.LogDebug("忽略未知叠加层消息: {Type}", type);
-                break;
-        }
-    }
-
-    private void ApplyStyle(JsonElement root)
-    {
-        // 仅更新弹幕样式；其余设置项由宿主默认值提供
-        if (root.TryGetProperty("danmaku", out var d) && d.ValueKind == JsonValueKind.Object)
-        {
-            var settings = new NotifyRelay.Models.Render.DanmakuStyleSettings();
-            if (d.TryGetProperty("fontSizePercent", out var v)) settings.FontSizePercent = v.GetDouble();
-            if (d.TryGetProperty("speed", out v)) settings.Speed = v.GetDouble();
-            if (d.TryGetProperty("opacityPercent", out v)) settings.OpacityPercent = v.GetDouble();
-            if (d.TryGetProperty("displayAreaPercent", out v)) settings.DisplayAreaPercent = v.GetDouble();
-            if (d.TryGetProperty("density", out v)) settings.Density = v.GetInt32();
-            if (d.TryGetProperty("fontFamilyName", out v)) settings.FontFamilyName = v.GetString() ?? settings.FontFamilyName;
-            if (d.TryGetProperty("displayScreenMode", out v)) settings.DisplayScreenMode = v.GetInt32();
-            if (d.TryGetProperty("performanceMode", out v)) settings.PerformanceMode = v.GetInt32();
-            _sink.UpdateStyle(settings);
-        }
-    }
-
-    private static string Str(JsonElement root, string name) =>
-        root.TryGetProperty(name, out var v) && v.ValueKind == JsonValueKind.String ? v.GetString() ?? string.Empty : string.Empty;
-
-    private static string StrOrNull(JsonElement root, string name) =>
-        root.TryGetProperty(name, out var v) && v.ValueKind == JsonValueKind.String ? v.GetString() : null;
-
-    private static bool Bool(JsonElement root, string name) =>
-        root.TryGetProperty(name, out var v) && v.ValueKind == JsonValueKind.True;
-
-    /// <summary>读取 base64 编码的字节字段；缺失或非法时返回 null。</summary>
-    private static byte[] Bytes(JsonElement root, string name)
-    {
-        if (!root.TryGetProperty(name, out var v) || v.ValueKind != JsonValueKind.String) return null;
-        var s = v.GetString();
-        if (string.IsNullOrEmpty(s)) return null;
-        try { return Convert.FromBase64String(s); } catch { return null; }
-    }
+    /// <summary>按 <c>type</c> 分派一条消息（与 C ABI 入口共用同一实现）。</summary>
+    private void Dispatch(string line) => MessageDispatcher.Dispatch(_sink, line);
 
     public void Dispose()
     {
