@@ -201,3 +201,35 @@ internal class SuperIslandItem : OverlayItem
         MultiEndUnselBitmap?.Dispose();
     }
 }
+
+/// <summary>
+/// 通用位图叠加项：位图由宿主流式生成后推送，本库只负责按屏幕坐标贴图。
+/// 用于媒体卡、超级岛等由宿主自行渲染的界面，避免本库重复维护一套 UI。
+/// </summary>
+internal class ImageOverlayItem : OverlayItem
+{
+    public string Id { get; set; } = string.Empty;
+    public byte[]? Png { get; set; }
+    public ID2D1Bitmap? Bitmap { get; set; }
+
+    /// <summary>目标位置与尺寸（物理像素，屏幕坐标）。</summary>
+    public float X { get; set; }
+    public float Y { get; set; }
+    public float Width { get; set; }
+    public float Height { get; set; }
+
+    public float Opacity { get; set; } = 1f;
+
+    /// <summary>位图内容已更新，需在渲染线程重建。</summary>
+    public bool Dirty { get; set; }
+
+    public override void Render(ID2D1DCRenderTarget rt)
+    {
+    }
+
+    public override void Dispose()
+    {
+        Bitmap?.Dispose();
+        Bitmap = null;
+    }
+}

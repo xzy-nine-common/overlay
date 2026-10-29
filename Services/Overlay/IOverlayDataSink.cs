@@ -71,4 +71,15 @@ public interface IOverlayDataSink
 
     /// <summary>移除指定 sourceId 的超级岛卡片。</summary>
     void RemoveSuperIsland(string sourceId);
+
+    /// <summary>
+    /// 贴一张宿主渲染好的位图。
+    ///
+    /// 界面由宿主自行绘制（Compose 等）后以 PNG 推送，本库只按屏幕坐标合成，
+    /// 不再重复维护一套 UI。相同 id 表示更新同一张图。
+    /// </summary>
+    void ShowImageOverlay(string id, float x, float y, float width, float height, byte[]? png, float opacity = 1f);
+
+    /// <summary>移除指定 id 的位图叠加。</summary>
+    void RemoveImageOverlay(string id);
 }

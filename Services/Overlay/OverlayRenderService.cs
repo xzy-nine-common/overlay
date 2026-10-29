@@ -38,6 +38,9 @@ public sealed partial class OverlayRenderService : IDisposable, IOverlayWatchdog
 
     // 顶部卡片（媒体 + SuperIsland），由 _lock 保护
     private readonly List<OverlayItem> _topItems = [];
+
+    /// <summary>宿主渲染后推送的位图叠加项（媒体卡、超级岛等由宿主播绘制）。</summary>
+    private readonly List<ImageOverlayItem> _imageOverlays = [];
     private readonly object _lock = new();
 
     // 弹幕请求队列（跨线程），由渲染线程分发到各屏覆盖层
@@ -333,6 +336,8 @@ public sealed partial class OverlayRenderService : IDisposable, IOverlayWatchdog
         {
             foreach (var item in _topItems) item.Dispose();
             _topItems.Clear();
+            foreach (var item in _imageOverlays) item.Dispose();
+            _imageOverlays.Clear();
         }
     }
 
@@ -395,6 +400,9 @@ public sealed partial class OverlayRenderService : IDisposable, IOverlayWatchdog
 
         var paint = ui.CreatePaintScope(rt, now, freq);
         ui.PaintTopCards(paint);
+
+        // 阶段一之后：宿主渲染的位图叠加（媒体卡、超级岛等由宿主播绘制）
+        RenderImageOverlays(rt);
 
         // 阶段二：弹幕——保留命令式（轨道分配与跨屏分发依赖窗口集合与时间推进）
         SpawnPending(o, rt);

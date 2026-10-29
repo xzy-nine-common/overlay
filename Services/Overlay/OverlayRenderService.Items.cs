@@ -318,4 +318,66 @@ public partial class OverlayRenderService
         lock (s.UrlPngCache) s.UrlPngCache.Clear();
         s.UrlFetching.Clear();
     }
+
+    void IOverlayDataSink.ShowImageOverlay(string id, float x, float y, float width, float height, byte[]? png, float opacity)
+    {
+        if (!Monitor.TryEnter(_lock, 2000))
+        {
+            _logger.LogWarning("覆盖层数据锁获取超时，跳过位图叠加更新");
+            return;
+        }
+        try
+        {
+            var existing = _imageOverlays.FirstOrDefault(m => m.Id == id);
+            if (existing != null)
+            {
+                existing.X = x;
+                existing.Y = y;
+                existing.Width = width;
+                existing.Height = height;
+                existing.Opacity = opacity;
+                // 字节内容有变才重建位图；引用相同视为同一帧
+                if (png != null && !ReferenceEquals(existing.Png, png))
+                {
+                    existing.Png = png;
+                    existing.Dirty = true;
+                }
+                return;
+            }
+
+            _imageOverlays.Add(new ImageOverlayItem
+            {
+                Id = id,
+                X = x,
+                Y = y,
+                Width = width,
+                Height = height,
+                Opacity = opacity,
+                Png = png,
+                Active = true,
+                Dirty = true,
+            });
+        }
+        finally
+        {
+            Monitor.Exit(_lock);
+        }
+    }
+
+    void IOverlayDataSink.RemoveImageOverlay(string id)
+    {
+        if (!Monitor.TryEnter(_lock, 2000)) return;
+        try
+        {
+            var existing = _imageOverlays.FirstOrDefault(m => m.Id == id);
+            if (existing == null) return;
+            existing.Active = false;
+            _imageOverlays.Remove(existing);
+            DeferDispose(existing);
+        }
+        finally
+        {
+            Monitor.Exit(_lock);
+        }
+    }
 }

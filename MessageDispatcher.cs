@@ -39,6 +39,19 @@ public static class MessageDispatcher
             case "media_remove":
                 sink.RemoveMediaCard(Str(root, "deviceId"));
                 break;
+            case "image_overlay_update":
+                sink.ShowImageOverlay(
+                    Str(root, "id"),
+                    Float(root, "x"),
+                    Float(root, "y"),
+                    Float(root, "width"),
+                    Float(root, "height"),
+                    Bytes(root, "png"),
+                    FloatOr(root, "opacity", 1f));
+                break;
+            case "image_overlay_remove":
+                sink.RemoveImageOverlay(Str(root, "id"));
+                break;
             case "style_update":
                 ApplyStyle(sink, root);
                 break;
@@ -85,6 +98,12 @@ public static class MessageDispatcher
 
     private static int Int(JsonElement root, string name) =>
         root.TryGetProperty(name, out var v) && v.ValueKind == JsonValueKind.Number && v.TryGetInt32(out var i) ? i : 0;
+
+    private static float FloatOr(JsonElement root, string name, float fallback) =>
+        root.TryGetProperty(name, out var v) && v.ValueKind == JsonValueKind.Number && v.TryGetSingle(out var f) ? f : fallback;
+
+    private static float Float(JsonElement root, string name) =>
+        root.TryGetProperty(name, out var v) && v.ValueKind == JsonValueKind.Number && v.TryGetSingle(out var f) ? f : 0f;
 
     private static long Long(JsonElement root, string name) =>
         root.TryGetProperty(name, out var v) && v.ValueKind == JsonValueKind.Number && v.TryGetInt64(out var l) ? l : 0;
