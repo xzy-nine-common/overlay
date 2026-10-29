@@ -43,12 +43,66 @@ public static class MessageDispatcher
                 ApplyStyle(sink, root);
                 break;
             case "superisland_update":
+                DispatchSuperIsland(sink, root);
+                break;
             case "superisland_remove":
-                // 超级岛：当前由本库自带模板绘制，消息体解析待 :superislandui 接入后补齐
+                sink.RemoveSuperIsland(Str(root, "sourceId"));
                 break;
             default:
                 break;
         }
+    }
+
+    /// <summary>
+    /// 分派超级岛更新。
+    ///
+    /// JVM 侧只透传原始字段：<c>paramV2Raw</c> 由本库的 ParamV2 解析器处理，
+    /// 无需在 JVM 侧重复实现超级岛布局解析。
+    /// </summary>
+    private static void DispatchSuperIsland(IOverlayDataSink sink, JsonElement root)
+    {
+        var state = new SuperIslandState
+        {
+            Title = StrOrNull(root, "title"),
+            Subtitle = StrOrNull(root, "subtitle"),
+            AdditionalText = StrOrNull(root, "text"),
+            Extra = StrOrNull(root, "extra"),
+            ParamV2Raw = StrOrNull(root, "paramV2Raw"),
+            ChangesJson = StrOrNull(root, "changes"),
+            IconPng = Bytes(root, "iconPng"),
+            Pics = Pics(root),
+            Progress = Int(root, "progress"),
+            TimerType = (TimerType)Int(root, "timerType"),
+            TimerValue = Long(root, "timerValue"),
+            TimerStartTime = Long(root, "timerStartTime"),
+            PausedSeconds = Long(root, "pausedSeconds"),
+            LastUpdateTime = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+        };
+        // paramV2Raw 需在此解析一次，渲染侧依赖 ParamV2 派生属性
+        SuperIslandParamV2Parser.ApplyToState(state, state.ParamV2Raw);
+        sink.ShowSuperIsland(Str(root, "sourceId"), Str(root, "deviceName"), state);
+    }
+
+    private static int Int(JsonElement root, string name) =>
+        root.TryGetProperty(name, out var v) && v.ValueKind == JsonValueKind.Number && v.TryGetInt32(out var i) ? i : 0;
+
+    private static long Long(JsonElement root, string name) =>
+        root.TryGetProperty(name, out var v) && v.ValueKind == JsonValueKind.Number && v.TryGetInt64(out var l) ? l : 0;
+
+    /// <summary>读取 pics 映射；非对象或空时返回 null。</summary>
+    private static Dictionary<string, string>? Pics(JsonElement root)
+    {
+        if (!root.TryGetProperty("pics", out var v) || v.ValueKind != JsonValueKind.Object) return null;
+        var map = new Dictionary<string, string>();
+        foreach (var p in v.EnumerateObject())
+        {
+            if (p.Value.ValueKind == JsonValueKind.String)
+            {
+                var s = p.Value.GetString();
+                if (!string.IsNullOrEmpty(s)) map[p.Name] = s;
+            }
+        }
+        return map.Count == 0 ? null : map;
     }
 
     private static void ApplyStyle(IOverlayDataSink sink, JsonElement root)
