@@ -38,15 +38,17 @@ internal static class Program
         OverlayChannelServer channel = null;
         try
         {
+            // 先起通道再起渲染：渲染期日志才有接收方（JVM 连接后即可见）
             service = new OverlayRenderService(
                 loggerFactory.CreateLogger<OverlayRenderService>(),
                 new DefaultOverlaySettings());
             sink = service;
-            sink.Start();
-            logger.LogInformation("叠加层渲染已启动");
 
             channel = new OverlayChannelServer(port, sink, logger);
             channel.Start();
+
+            sink.Start();
+            logger.LogInformation("叠加层渲染已启动");
 
             using var exit = new ManualResetEventSlim(false);
             Console.CancelKeyPress += (_, e) => { e.Cancel = true; exit.Set(); };

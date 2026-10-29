@@ -38,11 +38,47 @@ internal sealed class OverlayChannelServer : IDisposable
         _ = AcceptLoopAsync(_cts.Token);
     }
 
-    /// <summary>把一条日志写入所有已连接宿主。</summary>
+    /// <summary>待发日志缓冲：宿主尚未连接时暂存，连上后补发。</summary>
+    private readonly List<string> _pendingLogs = [];
+    private const int MaxPendingLogs = 200;
+
+    /// <summary>把一条日志写入所有已连接宿主；无连接时缓冲。</summary>
     private void PushLog(int level, string message)
     {
         if (message == null) return;
-        WriteLineToAll(JsonSerializer.Serialize(new { type = "log", level, message }));
+        var line = JsonSerializer.Serialize(new { type = "log", level, message });
+        lock (_clients)
+        {
+            if (_clients.Count == 0)
+            {
+                // 宿主尚未连接：保留最近若干条，连上后补发
+                if (_pendingLogs.Count >= MaxPendingLogs) _pendingLogs.RemoveAt(0);
+                _pendingLogs.Add(line);
+                return;
+            }
+        }
+        WriteLineToAll(line);
+    }
+
+    /// <summary>客户端连上后补发积压日志。</summary>
+    private void FlushPendingLogs(TcpClient client)
+    {
+        lock (_clients)
+        {
+            if (_pendingLogs.Count == 0) return;
+            var bytes = Encoding.UTF8.GetBytes(string.Join("\n", _pendingLogs) + "\n");
+            _pendingLogs.Clear();
+            try
+            {
+                var s = client.GetStream();
+                s.Write(bytes, 0, bytes.Length);
+                s.Flush();
+            }
+            catch
+            {
+                // 连接不可用：丢弃积压
+            }
+        }
     }
 
     /// <summary>向所有已连接客户端写一行；无连接时丢弃。</summary>
@@ -86,6 +122,7 @@ internal sealed class OverlayChannelServer : IDisposable
                 continue;
             }
             lock (_clients) _clients.Add(client);
+            FlushPendingLogs(client);
             _ = HandleClientAsync(client, token);
         }
     }
